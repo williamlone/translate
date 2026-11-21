@@ -1,0 +1,12 @@
+# 本地配置（含数据库路径、API Key 等敏感信息，切勿提交）
+translate.env
+*.env
+!config.example.env
+
+# 数据库文件本身
+*.mdb
+*.accdb
+
+# Python 缓存
+__pycache__/
+*.py[cod]
