@@ -172,7 +172,7 @@ python _inspect.py
 | `--limit` | `10` | 本次翻译的文章数量 |
 | `--workers` | `4` | 单篇文章内并行翻译的块数 |
 | `--article-workers` | `1` | 单批次内并行处理的文章数 |
-| `--chunk-chars` | `900` | 单次 API 请求的最大字符数 |
+| `--chunk-chars` | `600` | 单次 API 请求的最大字符数；HTML 密集文章可调到 400 |
 | `--timeout` | `120` | API 请求超时秒数 |
 | `--retries` | `4` | API 失败重试次数 |
 | `--min-interval` | `0` | 两次 API 请求之间的最小间隔秒数 |
@@ -259,7 +259,7 @@ deepseek: requested=10, succeeded=10, failed=0
 
 ### 译文为空或提示 dropped placeholder tokens
 
-使用推理模型时，思考过程可能占用全部输出 token。设置 `DEEPSEEK_DISABLE_THINKING=1`，并按需增大 `DEEPSEEK_MAX_TOKENS`。程序会校验占位符完整性，缺失时自动重试。
+使用推理模型时，思考过程可能占用全部输出 token。设置 `DEEPSEEK_DISABLE_THINKING=1`，并按需增大 `DEEPSEEK_MAX_TOKENS`。程序会校验占位符完整性，缺失时最多重试 5 次，并在重试请求中明确指出遗漏的占位符。若 HTML/URL 非常密集仍失败，可把 `--chunk-chars` 降到 400 或更低。
 
 ### 出现 429 限流
 

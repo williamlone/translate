@@ -93,7 +93,8 @@ class ProgressBar:
     def __init__(self, total: int, enabled: bool = True, width: int = 28):
         self.total = total
         self.width = width
-        self.enabled = enabled and total > 1
+        self.enabled = enabled and total > 0
+        self.interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
         self.count = 0
         self.succeeded = 0
         self.failed = 0
@@ -120,11 +121,14 @@ class ProgressBar:
         bar = "#" * filled + "-" * (self.width - filled)
         elapsed = time.monotonic() - self.started
         text = (
-            f"\r[{bar}] {self.count}/{self.total} ({pct * 100:3.0f}%) "
+            f"[{bar}] {self.count}/{self.total} ({pct * 100:3.0f}%) "
             f"ok={self.succeeded} fail={self.failed} {elapsed:.1f}s"
         )
-        padding = " " * max(0, self.last_len - len(text))
-        sys.stdout.write(text + padding)
+        if self.interactive:
+            padding = " " * max(0, self.last_len - len(text))
+            sys.stdout.write("\r" + text + padding)
+        else:
+            sys.stdout.write(text + "\n")
         sys.stdout.flush()
         self.last_len = len(text)
 
@@ -132,8 +136,9 @@ class ProgressBar:
         if not self.enabled:
             return
         with self.lock:
-            self._render()
-            sys.stdout.write("\n")
+            if self.interactive:
+                self._render()
+                sys.stdout.write("\n")
             sys.stdout.flush()
 
 
@@ -696,6 +701,15 @@ class DeepSeekTranslator(BaseTranslator):
         system_prompt = self.system_prompt_template
         if title:
             system_prompt += f"\nArticle title context: {title}"
+        missing = context.get("missing_placeholders")
+        if missing:
+            system_prompt += (
+                "\nCRITICAL RETRY: your previous output omitted protected placeholder token(s): "
+                + ", ".join(str(token) for token in missing)
+                + ". Return the COMPLETE translation again and include EVERY placeholder "
+                "exactly once, in the same form as in the input. Never omit, merge, renumber "
+                "or rewrite them, even if they look insignificant."
+            )
         payload = {
             "model": self.model,
             "messages": [
@@ -859,20 +873,22 @@ def translate_chunk_checked(
     chunk: str,
     translator: BaseTranslator,
     context: Dict[str, Any],
-    attempts: int = 3,
+    attempts: int = 5,
 ) -> str:
     leading, core, trailing = split_edge_tokens(chunk)
     if not core.strip():
         return chunk
     expected = {f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(core)}
     last_error = "translator dropped placeholder tokens"
+    retry_context = dict(context)
     for _ in range(attempts):
-        result = translator.translate(core, context)
+        result = translator.translate(core, retry_context)
         actual = {f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(result)}
         missing = expected - actual
         if not missing:
             return "".join(leading) + result + "".join(trailing)
         last_error = f"translator dropped placeholder tokens: {sorted(missing)[:3]}"
+        retry_context["missing_placeholders"] = sorted(missing)
     raise TranslateError(f"{last_error} (after {attempts} attempts)")
 
 
@@ -1085,7 +1101,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--glossary", default=os.environ.get("GLOSSARY_FILE"))
     parser.add_argument("--workers", type=int, default=4, help="parallel chunks per article")
     parser.add_argument("--article-workers", type=int, default=1, help="parallel articles in one batch")
-    parser.add_argument("--chunk-chars", type=int, default=900, help="max characters per API request")
+    parser.add_argument("--chunk-chars", type=int, default=600, help="max characters per API request")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--min-interval", type=float, default=0.0, help="minimum seconds between requests")
