@@ -53,9 +53,7 @@ OPAQUE_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 PROTECT_RE = re.compile(
-    r"(<\s*(script|style|pre|code)\b[^>]*>.*?<\s*/\s*\2\s*>"
-    r"|<[^>]+>"
-    r"|https?://[^\s<>\"']+)",
+    r"<\s*(script|style|pre|code)\b[^>]*>.*?<\s*/\s*\1\s*>",
     re.IGNORECASE | re.DOTALL,
 )
 
