@@ -681,22 +681,28 @@ class DeepSeekTranslator(BaseTranslator):
         self.rate_state = args.rate_state
         self.max_tokens = args.deepseek_max_tokens
         self.disable_thinking = args.deepseek_disable_thinking
-        glossary_lines = "\n".join(f"- {k} => {v}" for k, v in glossary.items())
-        self.system_prompt_template = (
+        self.glossary_lines = "\n".join(f"- {k} => {v}" for k, v in glossary.items())
+        self.system_prompt_base = (
             "You are a professional Chinese-to-English translator for a personal IT blog. "
             "Translate faithfully (信), express naturally (达), and write elegantly (雅). "
             "Keep the original meaning, tone and paragraph structure. Use idiomatic English. "
-            "Preserve HTML tags, attributes, URLs, numbers, code snippets and every placeholder "
-            "of the form __BLOGMTn__ exactly. A placeholder may represent only one character or "
-            "a piece of punctuation; never omit, merge or rewrite it even if it looks insignificant. "
-            "Do not add explanations, notes or summaries.\n"
-            "Use these fixed translations where applicable:\n"
-            f"{glossary_lines}"
+            "Preserve HTML tags, attributes, URLs, numbers and code snippets exactly. "
+            "Do not add explanations, notes or summaries."
+        )
+        self.placeholder_instruction = (
+            "\nPreserve every placeholder of the form __BLOGMTn__ exactly. A placeholder may "
+            "represent only one character or a piece of punctuation; never omit, merge or "
+            "rewrite it even if it looks insignificant."
         )
 
     def translate(self, text: str, context: Dict[str, Any]) -> str:
         title = (context.get("log_Title") or "").strip()
-        system_prompt = self.system_prompt_template
+        system_prompt = self.system_prompt_base
+        if context.get("has_placeholders"):
+            system_prompt += self.placeholder_instruction
+        system_prompt += (
+            "\nUse these fixed translations where applicable:\n" + self.glossary_lines
+        )
         if title:
             system_prompt += f"\nArticle title context: {title}"
         missing = context.get("missing_placeholders")
@@ -707,15 +713,6 @@ class DeepSeekTranslator(BaseTranslator):
                 + ". Return the COMPLETE translation again and include EVERY placeholder "
                 "exactly once, in the same form as in the input. Never omit, merge, renumber "
                 "or rewrite them, even if they look insignificant."
-            )
-        unexpected = context.get("unexpected_placeholders")
-        if unexpected:
-            system_prompt += (
-                "\nCRITICAL RETRY: your previous output contained placeholder token(s) that are "
-                "not in the input: "
-                + ", ".join(str(token) for token in unexpected)
-                + ". Remove them completely. Use ONLY the placeholders present in the input, "
-                "each exactly once. Never invent, duplicate or renumber them."
             )
         payload = {
             "model": self.model,
@@ -886,32 +883,33 @@ def translate_chunk_checked(
     if not core.strip():
         return chunk
     expected = Counter(f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(core))
+    call_context = dict(context)
+    call_context["has_placeholders"] = bool(expected)
+    call_context.pop("missing_placeholders", None)
+    call_context.pop("unexpected_placeholders", None)
     last_error = "placeholder tokens do not match source"
-    retry_context = dict(context)
     for _ in range(attempts):
-        result = translator.translate(core, retry_context)
+        result = translator.translate(core, call_context)
+        result = PLACEHOLDER_RE.sub(
+            lambda match: f"__BLOGMT{int(match.group(1))}__", result
+        )
         actual = Counter(f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(result))
         missing = expected - actual
         unexpected = actual - expected
-        if not missing and not unexpected:
+
+        if unexpected:
+            for token, count in unexpected.items():
+                for _ in range(count):
+                    result = result.replace(token, "", 1)
+
+        if not missing:
             return "".join(leading) + result + "".join(trailing)
 
-        problems: List[str] = []
-        if missing:
-            problems.append(
-                f"translator dropped placeholder tokens: {sorted(missing.elements())[:3]}"
-            )
-            retry_context["missing_placeholders"] = sorted(missing.elements())
-        else:
-            retry_context.pop("missing_placeholders", None)
-        if unexpected:
-            problems.append(
-                f"translator added placeholder tokens: {sorted(unexpected.elements())[:3]}"
-            )
-            retry_context["unexpected_placeholders"] = sorted(unexpected.elements())
-        else:
-            retry_context.pop("unexpected_placeholders", None)
-        last_error = "; ".join(problems)
+        last_error = (
+            "translator dropped placeholder tokens: "
+            f"{sorted(missing.elements())[:3]}"
+        )
+        call_context["missing_placeholders"] = sorted(missing.elements())
     raise TranslateError(f"{last_error} (after {attempts} attempts)")
 
 
