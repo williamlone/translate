@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -710,6 +710,15 @@ class DeepSeekTranslator(BaseTranslator):
                 "exactly once, in the same form as in the input. Never omit, merge, renumber "
                 "or rewrite them, even if they look insignificant."
             )
+        unexpected = context.get("unexpected_placeholders")
+        if unexpected:
+            system_prompt += (
+                "\nCRITICAL RETRY: your previous output contained placeholder token(s) that are "
+                "not in the input: "
+                + ", ".join(str(token) for token in unexpected)
+                + ". Remove them completely. Use ONLY the placeholders present in the input, "
+                "each exactly once. Never invent, duplicate or renumber them."
+            )
         payload = {
             "model": self.model,
             "messages": [
@@ -878,17 +887,33 @@ def translate_chunk_checked(
     leading, core, trailing = split_edge_tokens(chunk)
     if not core.strip():
         return chunk
-    expected = {f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(core)}
-    last_error = "translator dropped placeholder tokens"
+    expected = Counter(f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(core))
+    last_error = "placeholder tokens do not match source"
     retry_context = dict(context)
     for _ in range(attempts):
         result = translator.translate(core, retry_context)
-        actual = {f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(result)}
+        actual = Counter(f"__BLOGMT{int(n)}__" for n in PLACEHOLDER_RE.findall(result))
         missing = expected - actual
-        if not missing:
+        unexpected = actual - expected
+        if not missing and not unexpected:
             return "".join(leading) + result + "".join(trailing)
-        last_error = f"translator dropped placeholder tokens: {sorted(missing)[:3]}"
-        retry_context["missing_placeholders"] = sorted(missing)
+
+        problems: List[str] = []
+        if missing:
+            problems.append(
+                f"translator dropped placeholder tokens: {sorted(missing.elements())[:3]}"
+            )
+            retry_context["missing_placeholders"] = sorted(missing.elements())
+        else:
+            retry_context.pop("missing_placeholders", None)
+        if unexpected:
+            problems.append(
+                f"translator added placeholder tokens: {sorted(unexpected.elements())[:3]}"
+            )
+            retry_context["unexpected_placeholders"] = sorted(unexpected.elements())
+        else:
+            retry_context.pop("unexpected_placeholders", None)
+        last_error = "; ".join(problems)
     raise TranslateError(f"{last_error} (after {attempts} attempts)")
 
 

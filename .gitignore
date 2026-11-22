@@ -5,6 +5,7 @@ translate.env
 
 # 数据库文件本身
 *.mdb
+*.ldb
 *.accdb
 
 # Python 缓存
