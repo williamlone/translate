@@ -3,7 +3,8 @@
 """Translate Chinese fields into English in the configured Access database.
 
 Features:
-  * Writes results to the configured target table with the same table structure.
+  * Writes results to the configured target table, which mirrors the source table
+    plus translation metadata columns; the source table is left unchanged.
   * Resumes from the first record whose translation is missing, failed or stale.
   * Records per-article status and a per-run progress log.
   * Supports qwen-mt-lite / qwen-mt-plus, doubao-seed-translation and DeepSeek.
@@ -32,15 +33,17 @@ import pyodbc
 
 
 FIELDS_TO_TRANSLATE = ("log_Title", "log_Intro", "log_Content")
-REQUIRED_COLUMNS = {
-    "log_ID",
-    *FIELDS_TO_TRANSLATE,
-    "log_TransHash",
-    "log_TransStatus",
-    "log_TransModel",
-    "log_TransError",
-    "log_TransTime",
-}
+TRANSLATION_META_COLUMNS: "OrderedDict[str, str]" = OrderedDict(
+    [
+        ("log_TransHash", "VARCHAR(64)"),
+        ("log_TransStatus", "VARCHAR(32)"),
+        ("log_TransModel", "VARCHAR(64)"),
+        ("log_TransError", "LONGCHAR"),
+        ("log_TransTime", "DATETIME"),
+    ]
+)
+SOURCE_REQUIRED_COLUMNS = {"log_ID", *FIELDS_TO_TRANSLATE}
+TARGET_REQUIRED_COLUMNS = SOURCE_REQUIRED_COLUMNS | set(TRANSLATION_META_COLUMNS)
 
 PLACEHOLDER_RE = re.compile(r"__BLOGMT(\d+)__")
 TOKEN_RE = re.compile(r"__BLOGMT\d+__")
@@ -265,6 +268,7 @@ def create_target_table(cur: pyodbc.Cursor, source: str, target: str) -> bool:
     )
 
     definitions: List[str] = []
+    source_names = set(column_names(cols))
     for col in cols:
         sql_type = access_type(col)
         if sql_type == "COUNTER":
@@ -273,6 +277,10 @@ def create_target_table(cur: pyodbc.Cursor, source: str, target: str) -> bool:
             definitions.append(f"{q(col.column_name)} {sql_type} NOT NULL")
         else:
             definitions.append(f"{q(col.column_name)} {sql_type}")
+
+    for name, sql_type in TRANSLATION_META_COLUMNS.items():
+        if name not in source_names:
+            definitions.append(f"{q(name)} {sql_type}")
 
     if pk_rows:
         pk_cols = ", ".join(q(s.column_name) for s in pk_rows)
@@ -327,19 +335,44 @@ def create_progress_table(cur: pyodbc.Cursor, table: str) -> bool:
     return True
 
 
+def add_missing_columns(
+    cur: pyodbc.Cursor,
+    table: str,
+    definitions: "OrderedDict[str, str]",
+) -> List[str]:
+    existing = set(column_names(get_columns(cur, table)))
+    added: List[str] = []
+    for name, sql_type in definitions.items():
+        if name in existing:
+            continue
+        cur.execute(f"ALTER TABLE {q(table)} ADD COLUMN {q(name)} {sql_type}")
+        added.append(name)
+    return added
+
+
+def ensure_source_table(cur: pyodbc.Cursor, source: str) -> bool:
+    if table_exists(cur, source):
+        return False
+    definitions = [
+        f"{q('log_ID')} COUNTER NOT NULL",
+        *(f"{q(name)} LONGCHAR" for name in FIELDS_TO_TRANSLATE),
+        f"CONSTRAINT {q('PrimaryKey_Source')} PRIMARY KEY ({q('log_ID')})",
+    ]
+    cur.execute(f"CREATE TABLE {q(source)} ({', '.join(definitions)})")
+    return True
+
+
 def validate_schema(cur: pyodbc.Cursor, source: str, target: str) -> Tuple[List[Any], List[Any]]:
     src_cols = get_columns(cur, source)
     tgt_cols = get_columns(cur, target)
     src_names = set(column_names(src_cols))
     tgt_names = set(column_names(tgt_cols))
-    missing = REQUIRED_COLUMNS - src_names
-    if missing:
-        raise RuntimeError(f"source table lacks required columns: {sorted(missing)}")
-    if src_names != tgt_names:
-        raise RuntimeError(
-            "target table structure differs from source; "
-            f"only in source={sorted(src_names - tgt_names)}, only in target={sorted(tgt_names - src_names)}"
-        )
+    source_missing = SOURCE_REQUIRED_COLUMNS - src_names
+    if source_missing:
+        raise RuntimeError(f"source table lacks required columns: {sorted(source_missing)}")
+    target_missing = TARGET_REQUIRED_COLUMNS - tgt_names
+    if target_missing:
+        raise RuntimeError(f"target table lacks required columns: {sorted(target_missing)}")
     return src_cols, tgt_cols
 
 
@@ -391,20 +424,21 @@ def bootstrap_existing_translations(
     cur: pyodbc.Cursor,
     source: str,
     target: str,
-    cols: Sequence[Any],
+    src_cols: Sequence[Any],
+    tgt_cols: Sequence[Any],
 ) -> int:
     cur.execute(f"SELECT COUNT(*) FROM {q(target)}")
     if cur.fetchone()[0]:
         return 0
 
-    names = column_names(cols)
+    src_names = set(column_names(src_cols))
+    tgt_names = column_names(tgt_cols)
     en_cols = [f"{f}_EN" for f in FIELDS_TO_TRANSLATE]
-    if not all(c in names for c in en_cols):
+    if not all(c in src_names and c in tgt_names for c in en_cols):
         return 0
 
-    cur.execute(
-        f"SELECT * FROM {q(source)} WHERE log_TransStatus = ? ORDER BY log_ID", ("ok",)
-    )
+    where = " OR ".join(f"({q(c)} IS NOT NULL AND {q(c)} <> '')" for c in en_cols)
+    cur.execute(f"SELECT * FROM {q(source)} WHERE {where} ORDER BY log_ID")
     description = cur.description
     copied = 0
     for raw in cur.fetchall():
@@ -426,8 +460,8 @@ def bootstrap_existing_translations(
             conn,
             cur,
             target,
-            names,
-            [output.get(c) for c in names],
+            tgt_names,
+            [output.get(c) for c in tgt_names],
             row["log_ID"],
         )
         copied += 1
@@ -1219,14 +1253,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     conn = connect_access(args.db)
     try:
         cur = conn.cursor()
-        created_target = create_target_table(cur, args.source_table, args.target_table)
+        source_created = ensure_source_table(cur, args.source_table)
+        conn.commit()
+        create_target_table(cur, args.source_table, args.target_table)
+        added_target = add_missing_columns(cur, args.target_table, TRANSLATION_META_COLUMNS)
         create_progress_table(cur, args.progress_table)
         conn.commit()
+        if source_created:
+            print(f"Created source table {args.source_table}.")
+        if added_target:
+            print(f"Added missing columns to {args.target_table}: {', '.join(added_target)}")
 
         src_cols, tgt_cols = validate_schema(cur, args.source_table, args.target_table)
         names = column_names(tgt_cols)
         copied = bootstrap_existing_translations(
-            conn, cur, args.source_table, args.target_table, src_cols
+            conn, cur, args.source_table, args.target_table, src_cols, tgt_cols
         )
         if copied:
             print(f"Bootstrapped {copied} existing translated rows from source.")

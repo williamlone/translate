@@ -8,7 +8,7 @@
 
 1. **同一数据库内生成目标表**
    - 源表为 `blog_Article`，目标表为 `blog_Article_Trans`（表名由配置 `SOURCE_TABLE` / `TARGET_TABLE` 指定）。
-   - 表结构与源表相同，包括字段类型、可空性和索引。
+   - 目标表复制源表的字段、类型和索引，并额外增加 5 个翻译状态字段；源表不会被修改。
    - 英文结果写入待翻译字段，同时同步写入对应的 `_EN` 字段（若存在）。
 
 2. **自动续跑**
@@ -244,6 +244,10 @@ deepseek: requested=10, succeeded=10, failed=0
 ### 提示缺少必要配置
 
 说明 `translate.env` 不存在或没有填写 `BLOG_DB`、`SOURCE_TABLE`、`TARGET_TABLE`、`PROGRESS_TABLE`。复制模板并填写即可。
+
+### 新数据库提示 source table lacks required columns
+
+程序只要求源表包含 `log_ID` 和三个待翻译字段，不会向源表添加任何字段。5 个翻译状态字段只建在目标表中；如果源表不存在，程序会创建仅含必要字段的源表。目标表与进度表仍自动创建，无需手工建表。
 
 ### 提示缺少 ODBC 驱动
 
